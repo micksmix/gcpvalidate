@@ -1,19 +1,18 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
-use std::thread;
-use regex::Regex;
+use std::sync::Arc;
+use regex::bytes::Regex;
 use walkdir::WalkDir;
-use rayon::prelude::*;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value as JsonValue;
 use anyhow::{Result, anyhow};
 use yup_oauth2::{parse_service_account_key, ServiceAccountAuthenticator};
-use num_cpus;
-use tokio::runtime::Runtime;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
+use tokio::fs;
+use futures::StreamExt;
 
-const MAX_CONCURRENT_VALIDATIONS: usize = 500; // Adjust this value based on your needs
+const MAX_CONCURRENT_VALIDATIONS: usize = 500;
+const CHANNEL_BUFFER_SIZE: usize = 1000;
 
 #[derive(Debug, Clone)]
 struct ValidationResult {
@@ -23,9 +22,7 @@ struct ValidationResult {
 
 struct GcpValidator {
     regex: Regex,
-    runtime: Arc<Runtime>,
     semaphore: Arc<Semaphore>,
-    active_tasks: Arc<AtomicUsize>,
 }
 
 impl GcpValidator {
@@ -33,29 +30,20 @@ impl GcpValidator {
         let regex = Regex::new(r#"(?m)(?mis)(\{[^{}]*"auth_provider_x509_cert_url":.{0,512}?})|\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*"auth_provider_x509_cert_url":\s*".+?"(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}"#)
             .map_err(|e| anyhow!("Failed to compile regex: {}", e))?;
 
-        // Use a dedicated multi-threaded Tokio runtime for async operations
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get())  // Sets threads based on available CPUs
-                .enable_all()  // Enables all Tokio runtime components
-                .build()?  // Builds the runtime
-        );
-
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_VALIDATIONS));
 
         Ok(Self { 
             regex,
-            runtime,
             semaphore,
-            active_tasks: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    pub async fn validate_gcp_credentials(&self, gcp_json: &str) -> Result<(bool, Vec<String>)> {
-        // Acquire semaphore asynchronously
+    pub async fn validate_gcp_credentials(&self, gcp_json: &[u8]) -> Result<(bool, Vec<String>)> {
         let _permit = self.semaphore.acquire().await?;
 
-        let token_info: JsonValue = serde_json::from_str(gcp_json)?;
+        let gcp_json_str = String::from_utf8_lossy(gcp_json);
+        let token_info: JsonValue = serde_json::from_str(&gcp_json_str)?;
+        
         let project_id = token_info["project_id"].as_str().unwrap_or("Unknown");
         let client_email = token_info["client_email"].as_str().unwrap_or("Unknown");
         let credential_type = token_info["type"].as_str().unwrap_or("Unknown");
@@ -64,10 +52,10 @@ impl GcpValidator {
             return Ok((false, vec![]));
         }
 
-        let sa_key = parse_service_account_key(gcp_json)
+        let gcp_json_string = gcp_json_str.to_string();
+        let sa_key = parse_service_account_key(gcp_json_string)
             .map_err(|e| anyhow!("Failed to parse service account key: {}", e))?;
 
-        // Authenticate asynchronously
         let auth = ServiceAccountAuthenticator::builder(sa_key)
             .build()
             .await
@@ -90,75 +78,36 @@ impl GcpValidator {
         }
     }
 
-
-    pub fn extract_credentials(&self, content: &str) -> Vec<String> {
+    pub fn extract_credentials<'a>(&self, content: &'a [u8]) -> Vec<Vec<u8>> {
         self.regex
             .find_iter(content)
-            .map(|m| m.as_str().to_string())
+            .map(|m| m.as_bytes().to_vec())
             .collect()
     }
 }
 
-fn process_file(
-    path: &Path,
+async fn process_file(
+    path: PathBuf,
     validator: Arc<GcpValidator>,
-    tx: Sender<ValidationResult>,
-    concurrent_pb: Arc<ProgressBar>,
+    tx: mpsc::Sender<ValidationResult>,
 ) -> Result<()> {
-    validator.active_tasks.fetch_add(1, Ordering::SeqCst);
-    concurrent_pb.set_position(validator.active_tasks.load(Ordering::SeqCst) as u64);
+    let buffer = fs::read(&path).await?;
+    let credentials = validator.extract_credentials(&buffer);
 
-    let content = std::fs::read_to_string(path)?;
-    let credentials = validator.extract_credentials(&content);
-
-    // Set up batching
-    let batch_size = 10;
-    let batched_credentials: Vec<Vec<String>> = credentials.chunks(batch_size)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    // Spawn async tasks for each batch
-    validator.runtime.block_on(async {
-        for batch in batched_credentials {
-            let mut batch_results = Vec::new();
-
-            let validation_tasks: Vec<_> = batch.into_iter()
-                .map(|credential| {
-                    let validator = Arc::clone(&validator);
-                    async move {
-                        validator.validate_gcp_credentials(&credential).await
-                    }
-                })
-                .collect();
-
-            // Await all validations in the batch
-            let results = futures::future::join_all(validation_tasks).await;
-
-            for result in results {
-                if let Ok((true, metadata)) = result {
-                    batch_results.push(ValidationResult {
-                        path: path.to_string_lossy().to_string(),
-                        metadata,
-                    });
-                }
-            }
-
-            // Send batch results if any credentials are valid
-            for result in batch_results {
-                tx.send(result).map_err(|e| anyhow!(e))?; // Explicitly handle the SendError here
-            }
+    for credential in credentials {
+        if let Ok((true, metadata)) = validator.validate_gcp_credentials(&credential).await {
+            let result = ValidationResult {
+                path: path.to_string_lossy().to_string(),
+                metadata,
+            };
+            let _ = tx.send(result).await;
         }
-        Ok::<_, anyhow::Error>(()) // Return Ok(()) as the Result for the async block
-    })?;
-
-    validator.active_tasks.fetch_sub(1, Ordering::SeqCst);
-    concurrent_pb.set_position(validator.active_tasks.load(Ordering::SeqCst) as u64);
+    }
 
     Ok(())
 }
 
-
-fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <directory_to_scan>", args[0]);
@@ -167,7 +116,7 @@ fn main() -> Result<()> {
 
     let top_level_dir = &args[1];
     let validator = Arc::new(GcpValidator::new()?);
-    
+
     let files: Vec<PathBuf> = WalkDir::new(top_level_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -178,68 +127,55 @@ fn main() -> Result<()> {
     let total_files = files.len();
     println!("Found {} files to scan", total_files);
 
-    let multi = MultiProgress::new();
-    
-    let completed_pb = multi.add(ProgressBar::new(total_files as u64));
-    completed_pb.set_style(
+    let pb = ProgressBar::new(total_files as u64);
+    pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files completed ({eta})")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files processed ({eta})")
             .unwrap()
             .progress_chars("#>-"),
     );
 
-    let concurrent_pb = Arc::new(multi.add(ProgressBar::new(MAX_CONCURRENT_VALIDATIONS as u64)));
-    concurrent_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.yellow} Active validations: {pos}/{len}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
+    let (tx, mut rx) = mpsc::channel::<ValidationResult>(CHANNEL_BUFFER_SIZE);
 
-    let (tx, rx) = mpsc::channel::<ValidationResult>();
-
-    let printer_handle = thread::spawn(move || {
+    let printer_handle = tokio::spawn(async move {
         let mut found = 0;
-        while let Ok(result) = rx.recv() {
+        while let Some(result) = rx.recv().await {
             found += 1;
             println!("\nValid credentials found ({}) in {}:", found, result.path);
             for item in result.metadata {
                 println!("{}", item);
             }
-            completed_pb.inc(1);
+            pb.inc(1);
         }
-        completed_pb.finish_with_message("Scan complete!");
+        pb.finish_with_message("Scan complete!");
         println!("\nFound {} valid credentials", found);
     });
 
-    println!("Processing with Rayon’s default thread pool and up to {} concurrent validations", 
-             MAX_CONCURRENT_VALIDATIONS);
-
-    let active_tasks = Arc::clone(&validator.active_tasks);
-    let concurrent_pb_clone = Arc::clone(&concurrent_pb);
-    let progress_handle = thread::spawn(move || {
-        while active_tasks.load(Ordering::SeqCst) > 0 || concurrent_pb_clone.position() > 0 {
-            let current = active_tasks.load(Ordering::SeqCst);
-            concurrent_pb_clone.set_position(current as u64);
-            thread::sleep(std::time::Duration::from_millis(100));
-        }
-        concurrent_pb_clone.finish();
-    });
-
-    // Use Rayon’s default global thread pool with .into_par_iter()
-    files.into_par_iter()
-        .for_each(|path| {
-            let validator = Arc::clone(&validator);
-            let tx = tx.clone();
-            
-            if let Err(e) = process_file(&path, validator.clone(), tx.clone(), concurrent_pb.clone()) {
-                eprintln!("Error processing {}: {}", path.display(), e);
+    let mut join_set = JoinSet::new();
+    for path in files {
+        let validator = Arc::clone(&validator);
+        let tx = tx.clone();
+        
+        join_set.spawn(async move {
+            if let Err(e) = process_file(path, validator, tx).await {
+                eprintln!("Error processing file: {}", e);
             }
         });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        if let Err(e) = result {
+            eprintln!("Task failed: {}", e);
+        }
+    }
 
     drop(tx);
-    printer_handle.join().unwrap();
-    progress_handle.join().unwrap();
+    printer_handle.await?;
 
     Ok(())
+}
+
+#[tokio::main(worker_threads = 32)]
+async fn main() -> Result<()> {
+    run().await
 }
