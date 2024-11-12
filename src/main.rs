@@ -1,15 +1,28 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use regex::bytes::Regex;
 use walkdir::WalkDir;
 use serde_json::Value as JsonValue;
 use anyhow::{Result, anyhow};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio::fs;
-use futures::stream::{self, StreamExt};
-use yup_oauth2::{parse_service_account_key, ServiceAccountAuthenticator};
+use reqwest::Client;
+use openssl::rsa::Rsa;
+use openssl::sign::Signer;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use openssl::pkey::PKey;
+use chrono::{Utc, Duration};
 
 const MAX_CONCURRENT_VALIDATIONS: usize = 500;
-const MAX_CONCURRENT_FILES: usize = 100; // Limit the number of concurrent file processing tasks
+const CHANNEL_BUFFER_SIZE: usize = 1000;
+
+#[derive(Debug, Clone)]
+struct ValidationResult {
+    path: String,
+    metadata: Vec<String>,
+}
 
 struct GcpValidator {
     regex: Regex,
@@ -24,47 +37,93 @@ impl GcpValidator {
         Ok(Self { regex, semaphore })
     }
 
-    async fn validate_gcp_credentials(&self, gcp_json: Vec<u8>) -> Result<Option<Vec<String>>> {
+    pub async fn validate_gcp_credentials(&self, gcp_json: &[u8]) -> Result<(bool, Vec<String>)> {
         let _permit = self.semaphore.acquire().await?;
-
-        // Parse JSON from the credential
-        let gcp_json_str = String::from_utf8_lossy(&gcp_json);
+        let gcp_json_str = String::from_utf8_lossy(gcp_json);
         let token_info: JsonValue = serde_json::from_str(&gcp_json_str)?;
-        let project_id = token_info["project_id"].as_str().unwrap_or("Unknown").to_string();
-        let client_email = token_info["client_email"].as_str().unwrap_or("Unknown").to_string();
-        let credential_type = token_info["type"].as_str().unwrap_or("Unknown").to_string();
+        let project_id = token_info["project_id"].as_str().unwrap_or("Unknown");
+        let client_email = token_info["client_email"].as_str().unwrap_or("Unknown");
+        let private_key = token_info["private_key"].as_str().unwrap_or("Unknown");
+        let token_uri = token_info["token_uri"].as_str().unwrap_or("Unknown");
 
-        if project_id == "Unknown" || client_email == "Unknown" || credential_type == "Unknown" {
-            return Ok(None);
+        if project_id == "Unknown" || client_email == "Unknown" || private_key == "Unknown" || token_uri == "Unknown" {
+            return Ok((false, vec![]));
         }
 
-        // Parse the service account key
-        let sa_key = parse_service_account_key(gcp_json_str.to_string())
-            .map_err(|e| anyhow!("Failed to parse service account key: {}", e))?;
+        // Generate JWT
+        let jwt = self.create_jwt(client_email, private_key, token_uri)?;
 
-        // Build the authenticator
-        let auth = ServiceAccountAuthenticator::builder(sa_key)
-            .build()
-            .await
-            .map_err(|e| anyhow!("Failed to build authenticator: {}", e))?;
+        // Request an access token
+        let client = Client::new();
+        let response = client
+            .post(token_uri)
+            .form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &jwt)])
+            .send()
+            .await?;
 
-        let scopes = vec!["https://www.googleapis.com/auth/cloud-platform"];
-
-        // Attempt to get a token to validate the credentials
-        match auth.token(&scopes).await {
-            Ok(_) => {
-                let metadata = vec![
-                    format!("GCP Credential Type == {}", credential_type),
-                    format!("GCP Project ID == {}", project_id),
-                    format!("GCP Client Email == {}", client_email),
-                ];
-                Ok(Some(metadata))
-            },
-            Err(e) => Err(anyhow!("Failed to validate GCP credentials: {}", e)),
+        if response.status().is_success() {
+            let metadata = vec![
+                format!("GCP Credential Type == {}", "service_account"),
+                format!("GCP Project ID == {}", project_id),
+                format!("GCP Client Email == {}", client_email),
+            ];
+            Ok((true, metadata))
+        } else {
+            Err(anyhow!("Failed to validate GCP credentials"))
         }
     }
 
-    fn extract_credentials(&self, content: &[u8]) -> Vec<Vec<u8>> {
+    fn create_jwt(&self, client_email: &str, private_key: &str, token_uri: &str) -> Result<String> {
+        let now = Utc::now();
+        let iat = now.timestamp();
+        let exp = (now + Duration::hours(1)).timestamp();
+
+        // JWT Header
+        let header = URL_SAFE_NO_PAD.encode(
+            r#"{"alg":"RS256","typ":"JWT"}"#
+        );
+
+        // JWT Claims
+        let claims = format!(
+            r#"{{
+                "iss": "{}",
+                "scope": "https://www.googleapis.com/auth/cloud-platform",
+                "aud": "{}",
+                "exp": {},
+                "iat": {}
+            }}"#,
+            client_email, token_uri, exp, iat
+        );
+
+        // JWT Claims
+        let claims = format!(
+            r#"{{
+                "iss": "{}",
+                "scope": "https://www.googleapis.com/auth/cloud-platform",
+                "aud": "{}",
+                "exp": {},
+                "iat": {}
+            }}"#,
+            client_email, token_uri, exp, iat
+        );
+        let claims = URL_SAFE_NO_PAD.encode(claims);
+
+        // JWT Signature
+        let message = format!("{}.{}", header, claims);
+        let rsa_key = Rsa::private_key_from_pem(private_key.as_bytes())?;
+        let pkey = PKey::from_rsa(rsa_key)?;
+        let mut signer = Signer::new(openssl::hash::MessageDigest::sha256(), &pkey)?;
+        
+        signer.update(message.as_bytes())?;
+        let signature = signer.sign_to_vec()?;
+        let signature = URL_SAFE_NO_PAD.encode(signature);
+
+
+        // JWT Token
+        Ok(format!("{}.{}.{}", header, claims, signature))
+    }
+
+    pub fn extract_credentials<'a>(&self, content: &'a [u8]) -> Vec<Vec<u8>> {
         self.regex
             .find_iter(content)
             .map(|m| m.as_bytes().to_vec())
@@ -72,56 +131,105 @@ impl GcpValidator {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <directory_to_scan>", args[0]);
         std::process::exit(1);
     }
 
-    let dir = &args[1];
+    let top_level_dir = &args[1];
     let validator = Arc::new(GcpValidator::new()?);
 
-    let entries = WalkDir::new(dir)
+    let files: Vec<PathBuf> = WalkDir::new(top_level_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.path().to_owned())
-        .collect::<Vec<_>>();
+        .collect();
 
-    let validator = Arc::clone(&validator);
+    let (read_tx, mut read_rx) = mpsc::channel::<(PathBuf, Vec<u8>)>(CHANNEL_BUFFER_SIZE);
+    let (validate_tx, mut validate_rx) = mpsc::channel::<(PathBuf, Vec<u8>)>(CHANNEL_BUFFER_SIZE);
+    let (result_tx, mut result_rx) = mpsc::channel::<ValidationResult>(CHANNEL_BUFFER_SIZE);
 
-    stream::iter(entries)
-        .map(|path| {
-            let validator = Arc::clone(&validator);
-            async move {
-                let content = fs::read(&path).await?;
-                let credentials = validator.extract_credentials(&content);
-
-                for credential in credentials {
-                    if let Some(metadata) = validator.validate_gcp_credentials(credential).await? {
-                        println!("\nValid credentials found in {}:", path.display());
-                        for item in metadata {
-                            println!("{}", item);
-                        }
-                    }
+    // File Reading Pool
+    let reader_handle = tokio::spawn(async move {
+        let mut join_set = JoinSet::new();
+        for path in files {
+            let tx = read_tx.clone();
+            join_set.spawn(async move {
+                if let Ok(buffer) = fs::read(&path).await {
+                    let _ = tx.send((path, buffer)).await;
                 }
+            });
+        }
+        while join_set.join_next().await.is_some() {}
+    });
 
-                Ok::<(), anyhow::Error>(())
-            }
-        })
-        .buffer_unordered(MAX_CONCURRENT_FILES)
-        .for_each(|result| async {
-            if let Err(e) = result {
-                eprintln!("Error processing file: {:?}", e);
-            }
-        })
-        .await;
+    // Extraction Pool
+    let validator_clone = Arc::clone(&validator);
+    let extraction_handle = tokio::spawn(async move {
+        while let Some((path, buffer)) = read_rx.recv().await {
+            let validator = Arc::clone(&validator_clone);
+            let tx = validate_tx.clone();
+            tokio::spawn(async move {
+                let credentials = validator.extract_credentials(&buffer);
+                for credential in credentials {
+                    let _ = tx.send((path.clone(), credential)).await;
+                }
+            });
+        }
+    });
 
-    println!("Scan complete!");
+    // Validation Pool
+    let validator_clone = Arc::clone(&validator);
+    let validation_handle = tokio::spawn(async move {
+        while let Some((path, credential)) = validate_rx.recv().await {
+            let validator = Arc::clone(&validator_clone);
+            let tx = result_tx.clone();
+            tokio::spawn(async move {
+                if let Ok((true, metadata)) = validator.validate_gcp_credentials(&credential).await {
+                    let result = ValidationResult {
+                        path: path.to_string_lossy().to_string(),
+                        metadata,
+                    };
+                    let _ = tx.send(result).await;
+                }
+            });
+        }
+    });
+
+    // Printing Results
+    let printer_handle = tokio::spawn(async move {
+        while let Some(result) = result_rx.recv().await {
+            println!("\nValid credentials found in {}:", result.path);
+            for item in result.metadata {
+                println!("{}", item);
+            }
+        }
+        println!("Scan complete!");
+    });
+
+    // Await all handles
+    reader_handle.await?;
+    extraction_handle.await?;
+    validation_handle.await?;
+    printer_handle.await?;
+
     Ok(())
 }
+
+#[tokio::main(worker_threads = 64)]
+async fn main() -> Result<()> {
+    run().await
+}
+
+
+
+
+
+
+//////////////////////////////////////////////////////////////////
 
 // use std::path::PathBuf;
 // use std::sync::Arc;
@@ -156,39 +264,39 @@ async fn main() -> Result<()> {
 //         Ok(Self { regex, semaphore })
 //     }
 
-    // pub async fn validate_gcp_credentials(&self, gcp_json: &[u8]) -> Result<(bool, Vec<String>)> {
-    //     let _permit = self.semaphore.acquire().await?;
-    //     let gcp_json_str = String::from_utf8_lossy(gcp_json);
-    //     let token_info: JsonValue = serde_json::from_str(&gcp_json_str)?;
-    //     let project_id = token_info["project_id"].as_str().unwrap_or("Unknown");
-    //     let client_email = token_info["client_email"].as_str().unwrap_or("Unknown");
-    //     let credential_type = token_info["type"].as_str().unwrap_or("Unknown");
+//     pub async fn validate_gcp_credentials(&self, gcp_json: &[u8]) -> Result<(bool, Vec<String>)> {
+//         let _permit = self.semaphore.acquire().await?;
+//         let gcp_json_str = String::from_utf8_lossy(gcp_json);
+//         let token_info: JsonValue = serde_json::from_str(&gcp_json_str)?;
+//         let project_id = token_info["project_id"].as_str().unwrap_or("Unknown");
+//         let client_email = token_info["client_email"].as_str().unwrap_or("Unknown");
+//         let credential_type = token_info["type"].as_str().unwrap_or("Unknown");
 
-    //     if project_id == "Unknown" || client_email == "Unknown" || credential_type == "Unknown" {
-    //         return Ok((false, vec![]));
-    //     }
+//         if project_id == "Unknown" || client_email == "Unknown" || credential_type == "Unknown" {
+//             return Ok((false, vec![]));
+//         }
 
-    //     let gcp_json_string = gcp_json_str.to_string();
-    //     let sa_key = parse_service_account_key(gcp_json_string)
-    //         .map_err(|e| anyhow!("Failed to parse service account key: {}", e))?;
-    //     let auth = ServiceAccountAuthenticator::builder(sa_key)
-    //         .build()
-    //         .await
-    //         .map_err(|e| anyhow!("Failed to build authenticator: {}", e))?;
-    //     let scopes = vec!["https://www.googleapis.com/auth/cloud-platform"];
+//         let gcp_json_string = gcp_json_str.to_string();
+//         let sa_key = parse_service_account_key(gcp_json_string)
+//             .map_err(|e| anyhow!("Failed to parse service account key: {}", e))?;
+//         let auth = ServiceAccountAuthenticator::builder(sa_key)
+//             .build()
+//             .await
+//             .map_err(|e| anyhow!("Failed to build authenticator: {}", e))?;
+//         let scopes = vec!["https://www.googleapis.com/auth/cloud-platform"];
         
-    //     match auth.token(&scopes).await {
-    //         Ok(_) => {
-    //             let metadata = vec![
-    //                 format!("GCP Credential Type == {}", credential_type),
-    //                 format!("GCP Project ID == {}", project_id),
-    //                 format!("GCP Client Email == {}", client_email),
-    //             ];
-    //             Ok((true, metadata))
-    //         },
-    //         Err(e) => Err(anyhow!("Failed to validate GCP credentials: {}", e)),
-    //     }
-    // }
+//         match auth.token(&scopes).await {
+//             Ok(_) => {
+//                 let metadata = vec![
+//                     format!("GCP Credential Type == {}", credential_type),
+//                     format!("GCP Project ID == {}", project_id),
+//                     format!("GCP Client Email == {}", client_email),
+//                 ];
+//                 Ok((true, metadata))
+//             },
+//             Err(e) => Err(anyhow!("Failed to validate GCP credentials: {}", e)),
+//         }
+//     }
 
 //     pub fn extract_credentials<'a>(&self, content: &'a [u8]) -> Vec<Vec<u8>> {
 //         self.regex
