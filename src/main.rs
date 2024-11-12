@@ -8,12 +8,11 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::fs;
 use reqwest::Client;
-use openssl::rsa::Rsa;
-use openssl::sign::Signer;
+use ring::{rand, signature};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use openssl::pkey::PKey;
 use chrono::{Utc, Duration};
+use pem::parse;
 
 const MAX_CONCURRENT_VALIDATIONS: usize = 500;
 const CHANNEL_BUFFER_SIZE: usize = 1000;
@@ -73,7 +72,7 @@ impl GcpValidator {
         }
     }
 
-    fn create_jwt(&self, client_email: &str, private_key: &str, token_uri: &str) -> Result<String> {
+    fn create_jwt(&self, client_email: &str, private_key_pem: &str, token_uri: &str) -> Result<String> {
         let now = Utc::now();
         let iat = now.timestamp();
         let exp = (now + Duration::hours(1)).timestamp();
@@ -94,30 +93,32 @@ impl GcpValidator {
             }}"#,
             client_email, token_uri, exp, iat
         );
-
-        // JWT Claims
-        let claims = format!(
-            r#"{{
-                "iss": "{}",
-                "scope": "https://www.googleapis.com/auth/cloud-platform",
-                "aud": "{}",
-                "exp": {},
-                "iat": {}
-            }}"#,
-            client_email, token_uri, exp, iat
-        );
         let claims = URL_SAFE_NO_PAD.encode(claims);
 
-        // JWT Signature
+        // Create message to sign
         let message = format!("{}.{}", header, claims);
-        let rsa_key = Rsa::private_key_from_pem(private_key.as_bytes())?;
-        let pkey = PKey::from_rsa(rsa_key)?;
-        let mut signer = Signer::new(openssl::hash::MessageDigest::sha256(), &pkey)?;
-        
-        signer.update(message.as_bytes())?;
-        let signature = signer.sign_to_vec()?;
-        let signature = URL_SAFE_NO_PAD.encode(signature);
 
+        // Parse PEM private key
+        let pem = parse(private_key_pem)
+            .map_err(|e| anyhow!("Failed to parse PEM: {}", e))?;
+        
+        // Create key pair from the DER-encoded private key
+        let key_pair = signature::RsaKeyPair::from_pkcs8(&pem.contents())
+            .map_err(|_| anyhow!("Invalid RSA private key"))?;
+
+        // Sign the message
+        let rng = rand::SystemRandom::new();
+        let mut signature = vec![0; key_pair.public_modulus_len()];
+        key_pair
+            .sign(
+                &signature::RSA_PKCS1_SHA256,
+                &rng,
+                message.as_bytes(),
+                &mut signature,
+            )
+            .map_err(|_| anyhow!("Failed to sign JWT"))?;
+
+        let signature = URL_SAFE_NO_PAD.encode(&signature);
 
         // JWT Token
         Ok(format!("{}.{}.{}", header, claims, signature))
